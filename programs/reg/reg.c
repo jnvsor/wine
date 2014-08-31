@@ -22,6 +22,32 @@
 
 #define ARRAY_SIZE(A) (sizeof(A)/sizeof(*A))
 
+static const WCHAR short_hklm[] = {'H','K','L','M',0};
+static const WCHAR short_hkcu[] = {'H','K','C','U',0};
+static const WCHAR short_hkcr[] = {'H','K','C','R',0};
+static const WCHAR short_hku[] = {'H','K','U',0};
+static const WCHAR short_hkcc[] = {'H','K','C','C',0};
+static const WCHAR long_hklm[] = {'H','K','E','Y','_','L','O','C','A','L','_','M','A','C','H','I','N','E',0};
+static const WCHAR long_hkcu[] = {'H','K','E','Y','_','C','U','R','R','E','N','T','_','U','S','E','R',0};
+static const WCHAR long_hkcr[] = {'H','K','E','Y','_','C','L','A','S','S','E','S','_','R','O','O','T',0};
+static const WCHAR long_hku[] = {'H','K','E','Y','_','U','S','E','R','S',0};
+static const WCHAR long_hkcc[] = {'H','K','E','Y','_','C','U','R','R','E','N','T','_','C','O','N','F','I','G',0};
+
+static const struct
+{
+    HKEY key;
+    const WCHAR *short_name;
+    const WCHAR *long_name;
+}
+root_rels[] =
+{
+    {HKEY_LOCAL_MACHINE, short_hklm, long_hklm},
+    {HKEY_CURRENT_USER, short_hkcu, long_hkcu},
+    {HKEY_CLASSES_ROOT, short_hkcr, long_hkcr},
+    {HKEY_USERS, short_hku, long_hku},
+    {HKEY_CURRENT_CONFIG, short_hkcc, long_hkcc},
+};
+
 static const WCHAR type_none[] = {'R','E','G','_','N','O','N','E',0};
 static const WCHAR type_sz[] = {'R','E','G','_','S','Z',0};
 static const WCHAR type_expand_sz[] = {'R','E','G','_','E','X','P','A','N','D','_','S','Z',0};
@@ -95,51 +121,56 @@ static int reg_message(int msg)
     return reg_printfW(formatW, msg_buffer);
 }
 
-static int reg_StrCmpNIW(LPCWSTR str, LPCWSTR comp, int len)
+static inline BOOL path_rootname_cmp(const WCHAR *input_path, const WCHAR *rootkey_name)
 {
-    int i;
+    DWORD length = strlenW(rootkey_name);
 
-    for (i = 0; i < len; i++)
-    {
-        if (!str[i])
-        {
-            len = i + 1;
-            break;
-        }
-    }
-
-    return CompareStringW(CP_ACP, NORM_IGNORECASE, str, len, comp, len) - CSTR_EQUAL;
+    return (!strncmpiW(input_path, rootkey_name, length) &&
+            (input_path[length] == 0 || input_path[length] == '\\'));
 }
 
-static HKEY get_rootkey(LPWSTR key)
+static HKEY path_get_rootkey(const WCHAR *path)
 {
-    static const WCHAR szHKLM[] = {'H','K','L','M',0};
-    static const WCHAR szHKEY_LOCAL_MACHINE[] = {'H','K','E','Y','_','L','O','C','A','L','_','M','A','C','H','I','N','E',0};
-    static const WCHAR szHKCU[] = {'H','K','C','U',0};
-    static const WCHAR szHKEY_CURRENT_USER[] = {'H','K','E','Y','_','C','U','R','R','E','N','T','_','U','S','E','R',0};
-    static const WCHAR szHKCR[] = {'H','K','C','R',0};
-    static const WCHAR szHKEY_CLASSES_ROOT[] = {'H','K','E','Y','_','C','L','A','S','S','E','S','_','R','O','O','T',0};
-    static const WCHAR szHKU[] = {'H','K','U',0};
-    static const WCHAR szHKEY_USERS[] = {'H','K','E','Y','_','U','S','E','R','S',0};
-    static const WCHAR szHKCC[] = {'H','K','C','C',0};
-    static const WCHAR szHKEY_CURRENT_CONFIG[] = {'H','K','E','Y','_','C','U','R','R','E','N','T','_','C','O','N','F','I','G',0};
+    DWORD i;
 
-    if (!reg_StrCmpNIW(key, szHKLM, 4) ||
-        !reg_StrCmpNIW(key, szHKEY_LOCAL_MACHINE, 18))
-        return HKEY_LOCAL_MACHINE;
-    else if (!reg_StrCmpNIW(key, szHKCU, 4) ||
-             !reg_StrCmpNIW(key, szHKEY_CURRENT_USER, 17))
-        return HKEY_CURRENT_USER;
-    else if (!reg_StrCmpNIW(key, szHKCR, 4) ||
-             !reg_StrCmpNIW(key, szHKEY_CLASSES_ROOT, 17))
-        return HKEY_CLASSES_ROOT;
-    else if (!reg_StrCmpNIW(key, szHKU, 3) ||
-             !reg_StrCmpNIW(key, szHKEY_USERS, 10))
-        return HKEY_USERS;
-    else if (!reg_StrCmpNIW(key, szHKCC, 4) ||
-             !reg_StrCmpNIW(key, szHKEY_CURRENT_CONFIG, 19))
-        return HKEY_CURRENT_CONFIG;
-    else return NULL;
+    for (i = 0; i < ARRAY_SIZE(root_rels); i++)
+    {
+        if (path_rootname_cmp(path, root_rels[i].short_name) ||
+            path_rootname_cmp(path, root_rels[i].long_name))
+            return root_rels[i].key;
+    }
+
+    return NULL;
+}
+
+static HKEY path_open(const WCHAR *path, BOOL create)
+{
+    LONG err;
+    HKEY k;
+
+    k = path_get_rootkey(path);
+    if (!k)
+    {
+        reg_message(STRING_INVALID_KEY);
+        return NULL;
+    }
+
+    path = strchrW(path, '\\');
+    if (path)
+        path++;
+
+    if (create)
+        err = RegCreateKeyW(k, path, &k);
+    else
+        err = RegOpenKeyW(k, path, &k);
+
+    if (err != ERROR_SUCCESS)
+    {
+        reg_message(STRING_CANNOT_FIND);
+        return NULL;
+    }
+
+    return k;
 }
 
 static DWORD wchar_get_type(const WCHAR *type_name)
@@ -221,34 +252,16 @@ static int reg_add(WCHAR *key_name, WCHAR *value_name, BOOL value_empty,
 {
     static const WCHAR stubW[] = {'A','D','D',' ','-',' ','%','s',
         ' ','%','s',' ','%','d',' ','%','s',' ','%','s',' ','%','d','\n',0};
-    LPWSTR p;
-    HKEY root,subkey;
+    HKEY subkey;
 
     reg_printfW(stubW, key_name, value_name, value_empty, type, data, force);
 
     if (!sane_path(key_name))
         return 1;
 
-    p = strchrW(key_name,'\\');
-    if (!p)
-    {
-        reg_message(STRING_INVALID_KEY);
+    subkey = path_open(key_name, TRUE);
+    if (!subkey)
         return 1;
-    }
-    p++;
-
-    root = get_rootkey(key_name);
-    if (!root)
-    {
-        reg_message(STRING_INVALID_KEY);
-        return 1;
-    }
-
-    if(RegCreateKeyW(root,p,&subkey)!=ERROR_SUCCESS)
-    {
-        reg_message(STRING_INVALID_KEY);
-        return 1;
-    }
 
     if (value_name || data)
     {
@@ -288,8 +301,8 @@ static int reg_add(WCHAR *key_name, WCHAR *value_name, BOOL value_empty,
 static int reg_delete(WCHAR *key_name, WCHAR *value_name, BOOL value_empty,
     BOOL value_all, BOOL force)
 {
-    LPWSTR p;
-    HKEY root,subkey;
+    HKEY subkey;
+    LONG err;
 
     static const WCHAR stubW[] = {'D','E','L','E','T','E',
         ' ','-',' ','%','s',' ','%','s',' ','%','d',' ','%','d',' ','%','d','\n'
@@ -299,20 +312,9 @@ static int reg_delete(WCHAR *key_name, WCHAR *value_name, BOOL value_empty,
     if (!sane_path(key_name))
         return 1;
 
-    p = strchrW(key_name,'\\');
-    if (!p)
-    {
-        reg_message(STRING_INVALID_KEY);
+    subkey = path_open(key_name, FALSE);
+    if (!subkey)
         return 1;
-    }
-    p++;
-
-    root = get_rootkey(key_name);
-    if (!root)
-    {
-        reg_message(STRING_INVALID_KEY);
-        return 1;
-    }
 
     if (value_name && value_empty)
     {
@@ -334,19 +336,23 @@ static int reg_delete(WCHAR *key_name, WCHAR *value_name, BOOL value_empty,
     /* Delete subtree only if no /v* option is given */
     if (!value_name && !value_empty && !value_all)
     {
-        if (RegDeleteTreeW(root,p)!=ERROR_SUCCESS)
+        static const WCHAR empty_wstr[] = {0};
+
+        err = RegDeleteTreeW(subkey, NULL);
+        if (err != ERROR_SUCCESS)
+        {
+            reg_message(STRING_CANNOT_FIND);
+            return 1;
+        }
+
+        err = RegDeleteKeyW(subkey, empty_wstr);
+        if (err != ERROR_SUCCESS)
         {
             reg_message(STRING_CANNOT_FIND);
             return 1;
         }
         reg_message(STRING_SUCCESS);
         return 0;
-    }
-
-    if(RegOpenKeyW(root,p,&subkey)!=ERROR_SUCCESS)
-    {
-        reg_message(STRING_CANNOT_FIND);
-        return 1;
     }
 
     if (value_all)
