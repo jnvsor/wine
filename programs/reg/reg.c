@@ -18,9 +18,14 @@
 
 #include <windows.h>
 #include <wine/unicode.h>
+#include <wine/debug.h>
 #include "reg.h"
 
 #define ARRAY_SIZE(A) (sizeof(A)/sizeof(*A))
+
+WINE_DEFAULT_DEBUG_CHANNEL(reg);
+
+static const WCHAR empty_wstr[] = {0};
 
 static const WCHAR short_hklm[] = {'H','K','L','M',0};
 static const WCHAR short_hkcu[] = {'H','K','C','U',0};
@@ -189,43 +194,126 @@ static DWORD wchar_get_type(const WCHAR *type_name)
     return ~0u;
 }
 
-static LPBYTE get_regdata(LPWSTR data, DWORD reg_type, WCHAR separator, DWORD *reg_count)
+static BYTE *wchar_get_data(const WCHAR *input, const DWORD type, const WCHAR separator,
+    DWORD *size_out)
 {
-    LPBYTE out_data = NULL;
-    *reg_count = 0;
+    DWORD i;
 
-    switch (reg_type)
+    if (!input)
+        input = empty_wstr;
+
+    switch (type)
     {
+        case REG_NONE:
         case REG_SZ:
+        case REG_EXPAND_SZ:
         {
-            *reg_count = (lstrlenW(data) + 1) * sizeof(WCHAR);
-            out_data = HeapAlloc(GetProcessHeap(),0,*reg_count);
-            lstrcpyW((LPWSTR)out_data,data);
-            break;
+            BYTE *data;
+
+            i = (strlenW(input) + 1) * sizeof(WCHAR);
+            *size_out = i;
+            data = HeapAlloc(GetProcessHeap(), 0, i);
+            memcpy(data, input, i);
+            return data;
         }
         case REG_DWORD:
+        case REG_DWORD_BIG_ENDIAN:
         {
-            LPWSTR rest;
-            DWORD val;
-            val = strtolW(data, &rest, 0);
-            if (rest == data) {
-                static const WCHAR nonnumber[] = {'E','r','r','o','r',':',' ','/','d',' ','r','e','q','u','i','r','e','s',' ','n','u','m','b','e','r','.','\n',0};
-                reg_printfW(nonnumber);
-                break;
+            BYTE *data;
+            WCHAR *temp;
+
+            if (input[0] == '0' && (input[1] == 'x' || input[1] == 'X'))
+                i = strtoulW(input, &temp, 16);
+            else
+                i = strtoulW(input, &temp, 10);
+
+            if (input[0] == '-' || temp[0] || temp == input)
+            {
+                reg_message(STRING_INVALID_DWORD);
+                return NULL;
             }
-            *reg_count = sizeof(DWORD);
-            out_data = HeapAlloc(GetProcessHeap(),0,*reg_count);
-            ((LPDWORD)out_data)[0] = val;
-            break;
+
+            if (i == 0xffffffff)
+                WINE_FIXME("Check for integer overflow.\n");
+
+            data = HeapAlloc(GetProcessHeap(), 0, sizeof(DWORD));
+            *(DWORD *) data = i;
+            *size_out = sizeof(DWORD);
+            return data;
+        }
+        case REG_MULTI_SZ:
+        {
+            WCHAR *data = HeapAlloc(GetProcessHeap(), 0, (strlenW(input) + 1) * sizeof(WCHAR));
+            DWORD p;
+
+            for (i = 0, p = 0; i <= strlenW(input); i++, p++)
+            {
+                /* If this character is the separator, or no separator has been given and these
+                 * characters are "\\0", then add a 0 indicating the end of this string */
+                if ( (separator && input[i] == separator) ||
+                     (!separator && input[i] == '\\' && input[i + 1] == '0') )
+                {
+                    /* If it's the first character or the previous one was a separator */
+                    if (!p || data[p - 1] == 0)
+                    {
+                        HeapFree(GetProcessHeap(), 0, data);
+                        reg_message(STRING_INVALID_CMDLINE);
+                        return NULL;
+                    }
+                    data[p] = 0;
+
+                    if (!separator)
+                        i++;
+                }
+                else
+                    data[p] = input[i];
+            }
+
+            /* Add a 0 to the end if the string wasn't "", and it wasn't
+             * double-0-terminated already (In the case of a trailing separator) */
+            if (p > 1 && data[p - 2])
+                data[p++] = 0;
+
+            *size_out = p * sizeof(WCHAR);
+            return (BYTE *) data;
+        }
+        case REG_BINARY:
+        {
+            BYTE *data = HeapAlloc(GetProcessHeap(), 0, strlenW(input));
+            DWORD p, odd;
+
+            for (i = 0; i < strlenW(input); i++)
+            {
+                if (input[i] >= '0' && input[i] <= '9')
+                    data[i] = input[i] - '0';
+                else if (input[i] >= 'a' && input[i] <= 'f')
+                    data[i] = input[i] - 'a' + 10;
+                else if (input[i] >= 'A' && input[i] <= 'F')
+                    data[i] = input[i] - 'A' + 10;
+                else
+                {
+                    HeapFree(GetProcessHeap(), 0, data);
+                    reg_message(STRING_INVALID_CMDLINE);
+                    return NULL;
+                }
+            }
+
+            odd = i & 1;
+            p = i >> 1;
+            data += odd;
+
+            for (i = 0; i < p; i++)
+                data[i] = (data[i * 2] << 4) | data[i * 2 + 1];
+
+            *size_out = p + odd;
+            return data - odd;
         }
         default:
         {
-            static const WCHAR unhandled[] = {'U','n','h','a','n','d','l','e','d',' ','T','y','p','e',' ','0','x','%','x',' ',' ','d','a','t','a',' ','%','s','\n',0};
-            reg_printfW(unhandled, reg_type,data);
+            WINE_FIXME("Add support for registry type: %u\n", type);
+            return NULL;
         }
     }
-
-    return out_data;
 }
 
 static BOOL sane_path(const WCHAR *key)
@@ -286,7 +374,14 @@ static int reg_add(WCHAR *key_name, WCHAR *value_name, BOOL value_empty,
         }
 
         if (data)
-            reg_data = get_regdata(data,reg_type,separator,&reg_count);
+        {
+            reg_data = wchar_get_data(data, reg_type, separator, &reg_count);
+            if (!reg_data)
+            {
+                RegCloseKey(subkey);
+                return 1;
+            }
+        }
 
         RegSetValueExW(subkey,value_name,0,reg_type,reg_data,reg_count);
         HeapFree(GetProcessHeap(),0,reg_data);
@@ -336,8 +431,6 @@ static int reg_delete(WCHAR *key_name, WCHAR *value_name, BOOL value_empty,
     /* Delete subtree only if no /v* option is given */
     if (!value_name && !value_empty && !value_all)
     {
-        static const WCHAR empty_wstr[] = {0};
-
         err = RegDeleteTreeW(subkey, NULL);
         if (err != ERROR_SUCCESS)
         {
